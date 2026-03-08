@@ -1,14 +1,25 @@
+from contextlib import asynccontextmanager
 import pickle
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete
 import io
+
+from database import engine, get_db, Base
+from models import Prediction
+
+@asynccontextmanager
+async def lifespan(app):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
 
 
 # App setup
-app = FastAPI(title="UFC Fight Predictor API")
-
+app = FastAPI(title="UFC Fight Predictor API", lifespan=lifespan)
 
 # Middleware - temp perms for now
 app.add_middleware(
@@ -18,8 +29,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Loading the model
-with open("./ufc_predictor_v1.pkl", "rb") as f:
+with open("ufc_predictor_v1.pkl", "rb") as f:
     model = pickle.load(f)
 
 # Model req columns
@@ -35,45 +45,84 @@ FEATURE_COLS = [
     "weighted_td_avg_acc_diff", "weighted_td_def_diff", "weighted_sub_avg_diff"
 ]
 
-# ID cols
 ID_COLS = ["fight", "r_name", "b_name"]
 
 # Health ping for gcp
 @app.get("/health")
 def health():
-    return{"status": "ok"}
+    return {"status": "ok"}
 
 
-# Predcition Endpoint
+# Predcition and save db
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+
+    # Read and parse CSV
     contents = await file.read()
     df = pd.read_csv(io.BytesIO(contents))
 
-    # Validate columns exists
+    # Validate columns
     required = ID_COLS + FEATURE_COLS
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing columns: {missing}")
-    
-    # Keep for output
+
+    # Extract identities and features
     meta = df[ID_COLS].copy()
+    features = df[FEATURE_COLS].copy()
 
-    features = df[FEATURE_COLS.copy()]
-
-    # Run the model
+    # Run model
     p_red = model.predict_proba(features)[:, 1]
-
-    # Predict wiiner and confidence
     predicted_winner = np.where(p_red >= 0.5, "RED", "BLUE")
-    win_prob = np.where(p_red >= 0.5, p_red, 1 -p_red)
-    confidence_pct = (win_prob * 100).round()
+    win_prob = np.where(p_red >= 0.5, p_red, 1 - p_red)
+    confidence_pct = (win_prob * 100).round(2)
 
-    # Results
-    results = meta.copy()
-    results["predict_winner"] = predicted_winner
-    results["win_probability"] = win_prob
-    results["confidence_pct"] = confidence_pct
+    # 📌 Clear old predictions before saving new ones
+    await db.execute(delete(Prediction))
 
-    return results.to_dict(orient="records")
+    # 📌 Save each fight prediction as a row in the database
+    predictions = []
+    for i in range(len(meta)):
+        prediction = Prediction(
+            fight=meta.iloc[i]["fight"],
+            r_name=meta.iloc[i]["r_name"],
+            b_name=meta.iloc[i]["b_name"],
+            predicted_winner=str(predicted_winner[i]),
+            win_probability=float(win_prob[i]),
+            confidence_pct=float(confidence_pct[i])
+        )
+        db.add(prediction)
+        predictions.append(prediction)
 
+    # 📌 Commit = permanently save all changes to the database
+    await db.commit()
+
+    return [
+        {
+            "fight": p.fight,
+            "r_name": p.r_name,
+            "b_name": p.b_name,
+            "predicted_winner": p.predicted_winner,
+            "win_probability": p.win_probability,
+            "confidence_pct": p.confidence_pct
+        }
+        for p in predictions
+    ]
+
+@app.get("/predictions")
+async def get_predictions(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Prediction))
+    predictions = result.scalars().all()
+
+    return [
+        {
+            "fight": p.fight,
+            "r_name": p.r_name,
+            "b_name": p.b_name,
+            "predicted_winner": p.predicted_winner,
+            "win_probability": p.win_probability,
+            "confidence_pct": p.confidence_pct,
+            "created_at": p.created_at
+        }
+        for p in predictions
+    ]
